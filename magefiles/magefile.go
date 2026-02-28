@@ -10,7 +10,7 @@ import (
 	"runtime"
 )
 
-var dist = filepath.Join("..", "dist")
+var dist = "dist"
 var bin = filepath.Join(dist, "elmb")
 
 func init() {
@@ -23,22 +23,22 @@ func init() {
 func Build() error {
 	os.MkdirAll(dist, 0o755)
 	fmt.Println("building", bin)
-	return sh("go", "build", "-o", bin, ".")
+	return sh("go", "build", "-o", bin, "./seed")
 }
 
 // Lint runs staticcheck.
 func Lint() error {
-	return sh("staticcheck", "./...")
+	return sh("staticcheck", "./seed/...")
 }
 
 // Vet runs go vet.
 func Vet() error {
-	return sh("go", "vet", "./...")
+	return sh("go", "vet", "./seed/...")
 }
 
 // Test runs tests.
 func Test() error {
-	return sh("go", "test", "./...")
+	return sh("go", "test", "./seed/...")
 }
 
 // Check runs vet, lint, and test.

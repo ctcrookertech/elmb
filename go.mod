@@ -1,4 +1,4 @@
-module elmb
+module github.com/ctcrookertech/elmb
 
 go 1.24.1
 
