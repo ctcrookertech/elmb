@@ -14,9 +14,10 @@ import (
 var dist = "dist"
 
 var skip = map[string]bool{
-	"dist":      true,
-	"magefiles": true,
+	"dist":         true,
+	"magefiles":    true,
 	"node_modules": true,
+	"core":         true,
 }
 
 // targets discovers cmd_<name>.go files in non-skipped directories.
