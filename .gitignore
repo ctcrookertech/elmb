@@ -20,6 +20,9 @@ node_modules/
 *.swo
 *~
 
+# Secrets
+*.key
+
 # OS
 .DS_Store
 Thumbs.db
