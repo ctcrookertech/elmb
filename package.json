@@ -1,0 +1,13 @@
+{
+  "name": "elmb",
+  "private": true,
+  "scripts": {
+    "build": "cd seed && go run magefiles/mage_bootstrap.go build",
+    "lint": "cd seed && go run magefiles/mage_bootstrap.go lint",
+    "vet": "cd seed && go run magefiles/mage_bootstrap.go vet",
+    "test": "cd seed && go run magefiles/mage_bootstrap.go test",
+    "check": "cd seed && go run magefiles/mage_bootstrap.go check",
+    "clean": "cd seed && go run magefiles/mage_bootstrap.go clean",
+    "tidy": "cd seed && go run magefiles/mage_bootstrap.go tidy"
+  }
+}
