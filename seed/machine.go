@@ -68,28 +68,32 @@ type Item struct {
 	Source  string
 	Command string
 	Args    []string
+	Depth   int
 }
 
 // SpawnSpec describes a child elmb instance to spawn.
 type SpawnSpec struct {
-	Limit   Mode
+	Limit     Mode
 	Command   string
 	Args      []string
 	BaseFrame string
+	Stdin     string
 }
 
 // Machine holds the full ELMB state.
 type Machine struct {
-	Stacks  [modeCount][]Item
-	Frames  map[string][]FrameElement
-	Limit Mode
+	Stacks [modeCount][]Item
+	Frames map[string][]FrameElement
+	Limit  Mode
+	APIKey string
 }
 
 // NewMachine creates a machine with the seed action on the enact stack.
-func NewMachine(limit Mode, command string, args []string) *Machine {
+func NewMachine(limit Mode, apiKey string, command string, args []string) *Machine {
 	m := &Machine{
-		Frames:  map[string][]FrameElement{},
-		Limit: limit,
+		Frames: map[string][]FrameElement{},
+		Limit:  limit,
+		APIKey: apiKey,
 	}
 	seed := Item{Command: command, Args: args, Source: "seed"}
 	m.Stacks[ModeEnact] = append(m.Stacks[ModeEnact], seed)
@@ -130,7 +134,7 @@ func (m *Machine) drain(mode Mode) {
 	for len(m.Stacks[mode]) > 0 {
 		item := m.Stacks[mode][len(m.Stacks[mode])-1]
 		m.Stacks[mode] = m.Stacks[mode][:len(m.Stacks[mode])-1]
-		core.Line(modeTag[mode], "processing: "+truncate(item.Content+item.Command, 60))
+		core.Line(modeTag[mode], "processing: "+strings.ReplaceAll(item.Content+item.Command, "\n", " "))
 		switch mode {
 		case ModeEnact:
 			m.processEnact(item)
@@ -147,12 +151,12 @@ func (m *Machine) drain(mode Mode) {
 // arise moves an item up to the next mode, or to frame if at limit.
 func (m *Machine) arise(from Mode, item Item) {
 	if from >= m.Limit {
-		core.Line(core.Frame, "add: "+truncate(item.Content, 60))
+		core.Line(core.Frame, "add: "+strings.ReplaceAll(item.Content, "\n", " "))
 		m.framePush("", FrameElement{Value: item.Content, Level: LevelProc})
 		return
 	}
 	upper := from + 1
-	core.Line(core.Arise, modeNames[from]+" → "+modeNames[upper]+": "+truncate(item.Content, 60))
+	core.Line(core.Arise, modeNames[from]+" → "+modeNames[upper]+": "+strings.ReplaceAll(item.Content, "\n", " "))
 	m.Stacks[upper] = append(m.Stacks[upper], item)
 }
 
@@ -163,7 +167,7 @@ func (m *Machine) relax(from Mode, item Item) {
 		return
 	}
 	lower := from - 1
-	core.Line(core.Relax, modeNames[from]+" → "+modeNames[lower]+": "+truncate(item.Content, 60))
+	core.Line(core.Relax, modeNames[from]+" → "+modeNames[lower]+": "+strings.ReplaceAll(item.Content, "\n", " "))
 	m.Stacks[lower] = append(m.Stacks[lower], item)
 }
 
@@ -175,28 +179,12 @@ func (m *Machine) processEnact(item Item) {
 		core.Errorf("enact failed: %v", err)
 		return
 	}
-	core.Line(core.Frame, "add: "+truncate(result, 60))
+	core.Line(core.Frame, "add: "+strings.ReplaceAll(result, "\n", " "))
 	m.framePush("", FrameElement{Value: result, Level: LevelProc})
 	m.arise(ModeEnact, Item{Content: result, Source: core.Enact})
 }
 
-// processLearn is a stub: traces receipt, arises to model.
-func (m *Machine) processLearn(item Item) {
-	core.Line(core.Learn, "received: "+truncate(item.Content, 60))
-	m.arise(ModeLearn, item)
-}
-
-// processModel is a stub: traces receipt, arises to build.
-func (m *Machine) processModel(item Item) {
-	core.Line(core.Model, "received: "+truncate(item.Content, 60))
-	m.arise(ModeModel, item)
-}
-
-// processBuild is a stub: traces receipt, arises (to frame at limit).
-func (m *Machine) processBuild(item Item) {
-	core.Line(core.Build, "received: "+truncate(item.Content, 60))
-	m.arise(ModeBuild, item)
-}
+// processLearn, processModel, processBuild are in learn.go, model.go, build.go.
 
 // --- Frame operations ---
 
@@ -240,6 +228,43 @@ func (m *Machine) frameCreate(name string, elems []FrameElement) {
 	m.Frames[name] = elems
 }
 
+// --- Infer helpers ---
+
+func (m *Machine) frameText(name string) string {
+	elems := m.Frames[name]
+	if len(elems) == 0 {
+		return "(empty frame)"
+	}
+	var b strings.Builder
+	for i, e := range elems {
+		b.WriteString(strconv.Itoa(i))
+		b.WriteString(": ")
+		b.WriteString(e.Value)
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+func (m *Machine) runCommandWithInput(command string, args []string, stdin string) (string, error) {
+	bin := siblingPath(command)
+	stopProgress := core.StartProgress()
+	cmd := exec.Command(bin, args...)
+	if stdin != "" {
+		cmd.Stdin = strings.NewReader(stdin)
+	}
+	out, err := cmd.Output()
+	stopProgress()
+	core.Newline()
+	if err != nil {
+		return "", err
+	}
+	return parseOutputBlock(string(out)), nil
+}
+
+func (m *Machine) inferDirect(prompt string) (string, error) {
+	return m.runCommandWithInput("infer", []string{m.APIKey, "-"}, prompt)
+}
+
 // --- Subprocess execution ---
 
 func (m *Machine) runCommand(command string, args []string) (string, error) {
@@ -256,11 +281,15 @@ func (m *Machine) runCommand(command string, args []string) (string, error) {
 
 // --- Child spawning ---
 
-func (m *Machine) spawnSync(limit Mode, command string, args []string) (string, error) {
+func (m *Machine) spawnSync(spec SpawnSpec) (string, error) {
 	bin := siblingPath("elmb")
-	cliArgs := append([]string{"--limit", modeNames[limit], command}, args...)
+	cliArgs := append([]string{"--plain", "--limit", modeNames[spec.Limit], spec.Command}, spec.Args...)
 	stopProgress := core.StartProgress()
-	out, err := exec.Command(bin, cliArgs...).Output()
+	cmd := exec.Command(bin, cliArgs...)
+	if spec.Stdin != "" {
+		cmd.Stdin = strings.NewReader(spec.Stdin)
+	}
+	out, err := cmd.Output()
 	stopProgress()
 	core.Newline()
 	if err != nil {
@@ -277,7 +306,7 @@ func (m *Machine) spawnAll(specs []SpawnSpec) ([]string, error) {
 		wg.Add(1)
 		go func(i int, s SpawnSpec) {
 			defer wg.Done()
-			results[i], errs[i] = m.spawnSync(s.Limit, s.Command, s.Args)
+			results[i], errs[i] = m.spawnSync(s)
 		}(i, spec)
 	}
 	wg.Wait()
@@ -300,8 +329,11 @@ func (m *Machine) spawnAny(specs []SpawnSpec) (string, error) {
 	for _, spec := range specs {
 		go func(s SpawnSpec) {
 			bin := siblingPath("elmb")
-			cliArgs := append([]string{"--limit", modeNames[s.Limit], s.Command}, s.Args...)
+			cliArgs := append([]string{"--plain", "--limit", modeNames[s.Limit], s.Command}, s.Args...)
 			cmd := exec.CommandContext(ctx, bin, cliArgs...)
+			if s.Stdin != "" {
+				cmd.Stdin = strings.NewReader(s.Stdin)
+			}
 			out, err := cmd.Output()
 			if err != nil {
 				ch <- result{"", err}
@@ -314,14 +346,73 @@ func (m *Machine) spawnAny(specs []SpawnSpec) (string, error) {
 	return r.output, r.err
 }
 
-func (m *Machine) spawnAsync(specs []SpawnSpec) {
-	for _, spec := range specs {
-		go func(s SpawnSpec) {
-			bin := siblingPath("elmb")
-			cliArgs := append([]string{"--limit", modeNames[s.Limit], s.Command}, s.Args...)
-			exec.Command(bin, cliArgs...).Run()
-		}(spec)
+// AsyncResult holds the outcome of a single async child process.
+type AsyncResult struct {
+	Output string
+	Err    error
+	Done   bool
+}
+
+// AsyncHandle provides tracking and cancellation for async spawns.
+type AsyncHandle struct {
+	cancel  context.CancelFunc
+	done    chan struct{}
+	results []AsyncResult
+	mu      sync.Mutex
+}
+
+func (h *AsyncHandle) Cancel() { h.cancel() }
+
+func (h *AsyncHandle) AllDone() bool {
+	select {
+	case <-h.done:
+		return true
+	default:
+		return false
 	}
+}
+
+func (h *AsyncHandle) Results() []AsyncResult {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]AsyncResult, len(h.results))
+	copy(out, h.results)
+	return out
+}
+
+func (m *Machine) spawnAsync(specs []SpawnSpec) *AsyncHandle {
+	ctx, cancel := context.WithCancel(context.Background())
+	h := &AsyncHandle{
+		cancel:  cancel,
+		done:    make(chan struct{}),
+		results: make([]AsyncResult, len(specs)),
+	}
+	var wg sync.WaitGroup
+	for i, spec := range specs {
+		wg.Add(1)
+		go func(i int, s SpawnSpec) {
+			defer wg.Done()
+			bin := siblingPath("elmb")
+			cliArgs := append([]string{"--plain", "--limit", modeNames[s.Limit], s.Command}, s.Args...)
+			cmd := exec.CommandContext(ctx, bin, cliArgs...)
+			if s.Stdin != "" {
+				cmd.Stdin = strings.NewReader(s.Stdin)
+			}
+			out, err := cmd.Output()
+			h.mu.Lock()
+			h.results[i] = AsyncResult{
+				Output: parseOutputBlock(string(out)),
+				Err:    err,
+				Done:   true,
+			}
+			h.mu.Unlock()
+		}(i, spec)
+	}
+	go func() {
+		wg.Wait()
+		close(h.done)
+	}()
+	return h
 }
 
 // --- Helpers ---
@@ -335,27 +426,22 @@ func siblingPath(name string) string {
 	return filepath.Join(filepath.Dir(exe), name)
 }
 
-func stripANSI(s string) string {
+func parseOutputBlock(raw string) string {
+	// Strip ANSI escape sequences as a safety net for external commands.
 	var b strings.Builder
-	i := 0
-	for i < len(s) {
-		if s[i] == '\033' && i+1 < len(s) && s[i+1] == '[' {
+	for i := 0; i < len(raw); {
+		if raw[i] == '\033' && i+1 < len(raw) && raw[i+1] == '[' {
 			j := i + 2
-			for j < len(s) && s[j] != 'm' {
+			for j < len(raw) && raw[j] != 'm' {
 				j++
 			}
 			i = j + 1
 			continue
 		}
-		b.WriteByte(s[i])
+		b.WriteByte(raw[i])
 		i++
 	}
-	return b.String()
-}
-
-func parseOutputBlock(raw string) string {
-	clean := stripANSI(raw)
-	lines := strings.Split(clean, "\n")
+	lines := strings.Split(b.String(), "\n")
 	var content []string
 	capturing := false
 	for _, line := range lines {
@@ -374,10 +460,3 @@ func parseOutputBlock(raw string) string {
 	return strings.Join(content, "\n")
 }
 
-func truncate(s string, n int) string {
-	s = strings.ReplaceAll(s, "\n", " ")
-	if len(s) <= n {
-		return s
-	}
-	return s[:n-3] + "..."
-}

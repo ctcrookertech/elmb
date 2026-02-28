@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -18,7 +19,18 @@ func main() {
 	}
 
 	key := os.Args[1]
-	input := strings.Join(os.Args[2:], " ")
+	textArgs := os.Args[2:]
+	var input string
+	if len(textArgs) == 1 && textArgs[0] == "-" {
+		raw, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			core.Errorf("reading stdin: %v", err)
+			os.Exit(1)
+		}
+		input = string(raw)
+	} else {
+		input = strings.Join(textArgs, " ")
+	}
 
 	body, _ := json.Marshal(map[string]any{
 		"model":      "claude-sonnet-4-6",

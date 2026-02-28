@@ -19,6 +19,9 @@ const (
 	Relax    = "relax"
 )
 
+// Plain disables ANSI color codes in all tag output.
+var Plain bool
+
 var tagColors = map[string]string{
 	Output:   "\033[92m",
 	ExOutput: "\033[32m",
@@ -34,6 +37,9 @@ var tagColors = map[string]string{
 }
 
 func Tag(label string) string {
+	if Plain {
+		return fmt.Sprintf("[%8s]", label)
+	}
 	return fmt.Sprintf("%s[%8s]\033[0m", tagColors[label], label)
 }
 
