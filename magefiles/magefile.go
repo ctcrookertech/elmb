@@ -8,37 +8,73 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 )
 
 var dist = "dist"
-var bin = filepath.Join(dist, "elmb")
 
-func init() {
-	if runtime.GOOS == "windows" {
-		bin += ".exe"
+var skip = map[string]bool{
+	"dist":      true,
+	"magefiles": true,
+	"node_modules": true,
+}
+
+// targets discovers cmd_<name>.go files in non-skipped directories.
+// Each match produces dist/<name> (or dist/<name>.exe on Windows).
+func targets() ([]struct{ pkg, bin string }, error) {
+	dirs, err := os.ReadDir(".")
+	if err != nil {
+		return nil, err
 	}
+	var out []struct{ pkg, bin string }
+	for _, d := range dirs {
+		if !d.IsDir() || strings.HasPrefix(d.Name(), ".") || skip[d.Name()] {
+			continue
+		}
+		matches, _ := filepath.Glob(filepath.Join(d.Name(), "cmd_*.go"))
+		for _, m := range matches {
+			name := filepath.Base(m)
+			name = strings.TrimPrefix(name, "cmd_")
+			name = strings.TrimSuffix(name, ".go")
+			bin := filepath.Join(dist, name)
+			if runtime.GOOS == "windows" {
+				bin += ".exe"
+			}
+			out = append(out, struct{ pkg, bin string }{"./" + d.Name(), bin})
+		}
+	}
+	return out, nil
 }
 
-// Build compiles the binary.
+// Build compiles all discovered targets to dist/.
 func Build() error {
+	ts, err := targets()
+	if err != nil {
+		return err
+	}
 	os.MkdirAll(dist, 0o755)
-	fmt.Println("building", bin)
-	return sh("go", "build", "-o", bin, "./seed")
+	for _, t := range ts {
+		fmt.Println("building", t.bin, "from", t.pkg)
+		if err := sh("go", "build", "-o", t.bin, t.pkg); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// Lint runs staticcheck.
+// Lint runs staticcheck on all packages.
 func Lint() error {
-	return sh("staticcheck", "./seed/...")
+	return sh("staticcheck", "./...")
 }
 
-// Vet runs go vet.
+// Vet runs go vet on all packages.
 func Vet() error {
-	return sh("go", "vet", "./seed/...")
+	return sh("go", "vet", "./...")
 }
 
-// Test runs tests.
+// Test runs tests for all packages.
 func Test() error {
-	return sh("go", "test", "./seed/...")
+	return sh("go", "test", "./...")
 }
 
 // Check runs vet, lint, and test.
