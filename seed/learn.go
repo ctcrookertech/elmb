@@ -1,6 +1,7 @@
 package main
 
 import (
+	"sort"
 	"strconv"
 	"strings"
 
@@ -9,6 +10,7 @@ import (
 
 const maxLearnDepth = 3
 const compactThreshold = 10
+const maxRecursePerItem = 4
 
 type learnDirective struct {
 	Op   string // "+", "-", "=", "RECURSE", "DONE"
@@ -77,25 +79,46 @@ func (m *Machine) processLearn(item Item) {
 
 	frameCtx := m.frameText("")
 
-	extractPrompt := "You are analyzing output from a command execution.\n\n" +
-		"Current frame context:\n" + frameCtx + "\n" +
-		"New content to analyze:\n" + item.Content + "\n\n" +
-		"Extract key facts and observations. Output one directive per line:\n" +
-		"+ <text> — to add a new fact to the frame\n" +
-		"- <text> — to remove an existing fact that is now outdated or wrong\n" +
-		"Output only directives, no other text."
+	var extractSystemPrompt, extractUserPrompt string
+	var assessSystemPrompt, assessUserPrompt string
 
-	assessPrompt := "You are assessing whether deeper investigation is needed.\n\n" +
-		"Current frame context:\n" + frameCtx + "\n" +
-		"Content just analyzed:\n" + item.Content + "\n\n" +
-		"Should we investigate further? Output one per line:\n" +
-		"RECURSE: <question> — for each follow-up question worth investigating\n" +
-		"DONE — if no further investigation needed\n" +
-		"Output only directives, no other text."
+	if item.Source == core.Model {
+		extractSystemPrompt = "You are investigating a question that arose during planning. Analyze the available information to find answers."
+		extractUserPrompt = "Current frame context:\n" + frameCtx + "\n" +
+			"Question being investigated:\n" + item.Content + "\n\n" +
+			"Extract key findings relevant to the question. Output one directive per line:\n" +
+			"+ <text> — to add a finding to the frame\n" +
+			"- <text> — to remove an existing fact that is now outdated or wrong\n" +
+			"Output only directives, no other text."
+
+		assessSystemPrompt = "You are assessing whether a planning question has been adequately answered."
+		assessUserPrompt = "Current frame context:\n" + frameCtx + "\n" +
+			"Question being investigated:\n" + item.Content + "\n\n" +
+			"Is the question answered by the current frame? Output one per line:\n" +
+			"RECURSE: <question> — for each follow-up question worth investigating\n" +
+			"DONE — if the question is adequately answered\n" +
+			"Output only directives, no other text."
+	} else {
+		extractSystemPrompt = "You are analyzing output from a command execution."
+		extractUserPrompt = "Current frame context:\n" + frameCtx + "\n" +
+			"New content to analyze:\n" + item.Content + "\n\n" +
+			"Extract key facts and observations. Output one directive per line:\n" +
+			"+ <text> — to add a new fact to the frame\n" +
+			"- <text> — to remove an existing fact that is now outdated or wrong\n" +
+			"Output only directives, no other text."
+
+		assessSystemPrompt = "You are assessing whether deeper investigation is needed."
+		assessUserPrompt = "Current frame context:\n" + frameCtx + "\n" +
+			"Content just analyzed:\n" + item.Content + "\n\n" +
+			"Should we investigate further? Output one per line:\n" +
+			"RECURSE: <question> — for each follow-up question worth investigating\n" +
+			"DONE — if no further investigation needed\n" +
+			"Output only directives, no other text."
+	}
 
 	specs := []SpawnSpec{
-		{Limit: ModeEnact, Command: "infer", Args: []string{m.APIKey, "-"}, Stdin: extractPrompt},
-		{Limit: ModeEnact, Command: "infer", Args: []string{m.APIKey, "-"}, Stdin: assessPrompt},
+		{Limit: ModeEnact, Command: "infer", Args: []string{"-"}, BaseFrame: m.BaseFrame, Stdin: extractSystemPrompt + "\n\n" + extractUserPrompt},
+		{Limit: ModeEnact, Command: "infer", Args: []string{"-"}, BaseFrame: m.BaseFrame, Stdin: assessSystemPrompt + "\n\n" + assessUserPrompt},
 	}
 
 	core.Line(core.Learn, "running extract and assess infer calls")
@@ -122,13 +145,20 @@ func (m *Machine) processLearn(item Item) {
 	}
 
 	assessDirectives := parseLearnDirectives(results[1])
+	recurseCount := 0
 	for _, d := range assessDirectives {
 		if d.Op == "RECURSE" && item.Depth < maxLearnDepth {
+			if recurseCount >= maxRecursePerItem {
+				core.Line(core.Learn, "recurse cap reached, skipping: "+d.Text)
+				continue
+			}
+			recurseCount++
 			core.Line(core.Learn, "recursing at depth "+strconv.Itoa(item.Depth+1)+": "+d.Text)
 			m.Stacks[ModeLearn] = append(m.Stacks[ModeLearn], Item{
-				Content: d.Text,
-				Source:  core.Learn,
-				Depth:   item.Depth + 1,
+				Content:    d.Text,
+				Source:     core.Learn,
+				Depth:      item.Depth + 1,
+				RelaxCount: item.RelaxCount,
 			})
 		}
 	}
@@ -141,7 +171,7 @@ func (m *Machine) processLearn(item Item) {
 	if len(observations) > 0 {
 		summary = strings.Join(observations, "; ")
 	}
-	m.arise(ModeLearn, Item{Content: summary, Source: core.Learn, Depth: item.Depth})
+	m.arise(ModeLearn, Item{Content: summary, Source: core.Learn, Depth: item.Depth, RelaxCount: item.RelaxCount})
 }
 
 func (m *Machine) frameRemoveMatching(name string, text string) {
@@ -187,9 +217,10 @@ func (m *Machine) compactFrame(name string) {
 	}
 
 	directives := parseLearnDirectives(result)
-	// Apply in reverse order so indices stay valid
-	for i := len(directives) - 1; i >= 0; i-- {
-		d := directives[i]
+
+	// Filter to only = directives and validate
+	var compactDirs []learnDirective
+	for _, d := range directives {
 		if d.Op != "=" {
 			continue
 		}
@@ -197,6 +228,28 @@ func (m *Machine) compactFrame(name string) {
 			core.Line(core.Learn, "skipping out-of-bounds compact range")
 			continue
 		}
+		compactDirs = append(compactDirs, d)
+	}
+
+	// Sort by Low descending to detect overlaps and apply safely
+	sort.Slice(compactDirs, func(i, j int) bool {
+		return compactDirs[i].Low > compactDirs[j].Low
+	})
+
+	// Validate no overlaps: each range's High must not exceed the previous range's Low
+	prevLow := len(m.Frames[name])
+	var valid []learnDirective
+	for _, d := range compactDirs {
+		if d.High > prevLow {
+			core.Line(core.Learn, "skipping overlapping compact range "+strconv.Itoa(d.Low)+"-"+strconv.Itoa(d.High))
+			continue
+		}
+		valid = append(valid, d)
+		prevLow = d.Low
+	}
+
+	// Apply in descending Low order so indices stay valid
+	for _, d := range valid {
 		core.Line(core.Learn, "compacting entries "+strconv.Itoa(d.Low)+"-"+strconv.Itoa(d.High)+": "+d.Text)
 		replacement := FrameElement{Value: d.Text, Level: LevelProc}
 		frame := m.Frames[name]
