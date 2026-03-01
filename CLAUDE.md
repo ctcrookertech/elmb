@@ -10,11 +10,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **Trace every operation with context.** When an operation runs, it should say what it's doing. Build prints what it's building and from where. Clean says it's cleaning. Silent operations are bugs.
 
+**No silent failures.** Nothing is "best effort". Every operation either succeeds or fails visibly. Do not swallow errors or hide failures behind fallback paths.
+
 **No external dependencies in executables.** All executables use only the Go standard library. Build tooling (magefiles) may use external packages.
 
 ## Build System
 
-Mage (zero-install via `go run magefiles/mage_bootstrap.go <target>`) wrapped by npm scripts:
+Mage (zero-install) wrapped by npm scripts. Always use the npm wrappers — never run `go` or `mage` commands directly:
 
 ```
 npm run build    # compile all targets to dist/
@@ -25,8 +27,6 @@ npm run check    # vet + lint + test in sequence
 npm run clean    # rm -rf dist/
 npm run tidy     # go mod tidy
 ```
-
-No mage binary install required.
 
 ## Convention-Based Build
 
@@ -73,3 +73,7 @@ Tag colors (ANSI, applied to the full tag including brackets):
 | `[   error]` | red         | `\033[31m` |
 
 Format: `fmt.Sprintf("\033[XXm[%8s]\033[0m", label)`
+
+## Workflow
+
+After making changes, always run `npm run build` and `npm run vet` to verify a clean build before considering the work done.
