@@ -59,14 +59,14 @@ func looksActionable(text string) bool {
 func (m *Machine) processBuild(item Item) {
 	if item.Depth > maxBuildDepth {
 		core.Line(core.Build, "max depth reached, finalizing")
-		m.framePush("", FrameElement{Value: item.Content, Level: LevelTask})
+		m.framePush(FrameTask, FrameElement{Value: item.Content, Level: LevelTask})
 		return
 	}
 
 	steps := parseBuildSteps(item.Content)
 	if len(steps) == 0 {
 		core.Line(core.Build, "no steps found, adding to frame")
-		m.framePush("", FrameElement{Value: item.Content, Level: LevelTask})
+		m.framePush(FrameTask, FrameElement{Value: item.Content, Level: LevelTask})
 		return
 	}
 
@@ -90,17 +90,16 @@ func (m *Machine) processBuild(item Item) {
 
 		if !step.Actionable {
 			core.Line(core.Build, "informational, adding to frame")
-			m.framePush("", FrameElement{Value: step.Text, Level: LevelStep})
+			m.framePush(FrameStep, FrameElement{Value: step.Text, Level: LevelStep})
 			continue
 		}
 
 		core.Line(core.Build, "spawning child elmb for: "+step.Text)
 		result, err := m.spawnSync(SpawnSpec{
-			Limit:     ModeModel,
-			Command:   "infer",
-			Args:      []string{"-"},
-			BaseFrame: m.BaseFrame,
-			Stdin:     step.Text,
+			Limit:   ModeModel,
+			Command: "infer",
+			Args:    []string{"-"},
+			Stdin:   step.Text,
 		})
 		if err != nil {
 			core.Errorf("build step failed: %v", err)
@@ -109,7 +108,7 @@ func (m *Machine) processBuild(item Item) {
 		}
 
 		core.Line(core.Build, "step completed, adding result to frame")
-		m.framePush("", FrameElement{Value: result, Level: LevelStep})
+		m.framePush(FrameStep, FrameElement{Value: result, Level: LevelStep})
 	}
 
 	if len(failedSteps) > 0 && item.Depth < maxBuildDepth {
@@ -129,7 +128,7 @@ func (m *Machine) processBuild(item Item) {
 	if len(failedSteps) > 0 {
 		core.Line(core.Build, "finalizing with "+strconv.Itoa(len(failedSteps))+" unresolved failures")
 		for _, f := range failedSteps {
-			m.framePush("", FrameElement{Value: "failed: " + f.Text, Level: LevelStep})
+			m.framePush(FrameStep, FrameElement{Value: "failed: " + f.Text, Level: LevelStep})
 		}
 	}
 }

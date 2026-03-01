@@ -69,6 +69,21 @@ const (
 	LevelStep
 )
 
+// Frame type names and fixed concatenation order.
+const (
+	FrameBase  = "base"
+	FrameInput = "input"
+	FrameProc  = "proc"
+	FrameTask  = "task"
+	FrameStep  = "step"
+)
+
+var frameOrder = []string{FrameBase, FrameInput, FrameProc, FrameTask, FrameStep}
+
+var validFrameTypes = map[string]bool{
+	FrameBase: true, FrameInput: true, FrameProc: true, FrameTask: true, FrameStep: true,
+}
+
 // FrameElement is a typed element in a frame.
 type FrameElement struct {
 	Value string     `json:"value"`
@@ -87,11 +102,10 @@ type Item struct {
 
 // SpawnSpec describes a child elmb instance to spawn.
 type SpawnSpec struct {
-	Limit     Mode
-	Command   string
-	Args      []string
-	BaseFrame string
-	Stdin     string
+	Limit   Mode
+	Command string
+	Args    []string
+	Stdin   string
 }
 
 const (
@@ -107,7 +121,6 @@ type Machine struct {
 	Limit             Mode
 	APIKey            string
 	Config            *Config
-	BaseFrame         string
 	APICallsRemaining int
 	TimeoutSeconds    int
 	Errors            []string
@@ -132,22 +145,21 @@ func NewMachine(limit Mode, config *Config, command string, args []string, baseF
 		}
 	}
 
-	if baseFrame == "" {
-		baseFrame = "OS: " + runtime.GOOS + "/" + runtime.GOARCH
-	}
-
 	m := &Machine{
 		Frames:            map[string][]FrameElement{},
 		Limit:             limit,
 		APIKey:            apiKey,
 		Config:            config,
-		BaseFrame:         baseFrame,
 		APICallsRemaining: budget,
 		TimeoutSeconds:    timeout,
 	}
-	seed := Item{Command: command, Args: args, Source: "seed"}
+	m.framePush(FrameBase, FrameElement{Value: "OS: " + runtime.GOOS + "/" + runtime.GOARCH, Level: LevelBase})
+	if baseFrame != "" {
+		m.framePush(FrameBase, FrameElement{Value: baseFrame, Level: LevelBase})
+	}
+	seed := Item{Command: command, Args: args, Source: "seed", Content: strings.Join(args, " ")}
 	m.Stacks[ModeEnact] = append(m.Stacks[ModeEnact], seed)
-	m.framePush("", FrameElement{Value: command + " " + strings.Join(args, " "), Level: LevelBase})
+	m.framePush(FrameInput, FrameElement{Value: strings.Join(args, " "), Level: LevelBase})
 	return m
 }
 
@@ -178,12 +190,17 @@ func (m *Machine) Run() error {
 	}
 
 	// Output frame for parent capture
-	defaultFrame := m.Frames[""]
-	core.Line(core.Frame, "done, frame has "+strconv.Itoa(len(defaultFrame))+" items")
+	total := 0
+	for _, name := range frameOrder {
+		total += len(m.Frames[name])
+	}
+	core.Line(core.Frame, "done, frame has "+strconv.Itoa(total)+" items")
 	core.BlockStart()
-	for _, elem := range defaultFrame {
-		core.Print(elem.Value)
-		core.Print("\n")
+	for _, name := range frameOrder {
+		for _, elem := range m.Frames[name] {
+			core.Print(elem.Value)
+			core.Print("\n")
+		}
 	}
 	core.BlockEnd()
 
@@ -205,12 +222,20 @@ func (m *Machine) drain(mode Mode) {
 
 		item := m.Stacks[mode][len(m.Stacks[mode])-1]
 		m.Stacks[mode] = m.Stacks[mode][:len(m.Stacks[mode])-1]
-		core.Line(modeTag[mode], "processing: "+strings.ReplaceAll(item.Content+item.Command, "\n", " "))
+		display := item.Content
+		if item.Command != "" {
+			display = item.Command + " " + strings.Join(item.Args, " ")
+		}
+		core.Line(modeTag[mode], "processing: "+strings.ReplaceAll(display, "\n", " "))
 
 		TraceItem(modeNames[mode], item)
 		TraceState(m)
 
-		if input := TracePause(); input != "" {
+		for {
+			input := TracePause()
+			if input == "" {
+				break
+			}
 			m.DebugCommand(input)
 		}
 
@@ -231,7 +256,7 @@ func (m *Machine) drain(mode Mode) {
 func (m *Machine) arise(from Mode, item Item) {
 	if from >= m.Limit {
 		core.Line(core.Frame, "add: "+strings.ReplaceAll(item.Content, "\n", " "))
-		m.framePush("", FrameElement{Value: item.Content, Level: LevelProc})
+		m.framePush(FrameProc, FrameElement{Value: item.Content, Level: LevelProc})
 		return
 	}
 	upper := from + 1
@@ -248,7 +273,7 @@ func (m *Machine) relax(from Mode, item Item) {
 	item.RelaxCount++
 	if item.RelaxCount >= MaxRelaxCount {
 		core.Line(core.Frame, "relax count exceeded, forcing to frame: "+strings.ReplaceAll(item.Content, "\n", " "))
-		m.framePush("", FrameElement{Value: item.Content, Level: LevelProc})
+		m.framePush(FrameProc, FrameElement{Value: item.Content, Level: LevelProc})
 		return
 	}
 	lower := from - 1
@@ -258,6 +283,18 @@ func (m *Machine) relax(from Mode, item Item) {
 
 // processEnact runs a command, captures output, adds to frame, arises to learn.
 func (m *Machine) processEnact(item Item) {
+	if item.Source == "seed" {
+		prompt := "Respond precisely, \"[ satisfy] \" + <single best guess description of what will satisfy the expressed intent, not an answer>, based on their command and parameters: " + item.Command + " " + strings.Join(item.Args, " ")
+		satisfyResult, err := m.runCommandWithInput("infer", []string{"--model", "haiku", "-"}, prompt)
+		if err != nil {
+			core.Errorf("satisfy failed: %v", err)
+			m.Errors = append(m.Errors, "satisfy: "+err.Error())
+			return
+		}
+		satisfyText := strings.TrimPrefix(satisfyResult, "[ satisfy] ")
+		core.Line(core.Satisfy, satisfyText)
+	}
+
 	core.Line(core.Enact, "running: "+item.Command)
 	result, err := m.runCommand(item.Command, item.Args)
 	if err != nil {
@@ -268,7 +305,7 @@ func (m *Machine) processEnact(item Item) {
 		return
 	}
 	core.Line(core.Frame, "add: "+strings.ReplaceAll(result, "\n", " "))
-	m.framePush("", FrameElement{Value: result, Level: LevelProc})
+	m.framePush(FrameProc, FrameElement{Value: result, Level: LevelProc})
 	m.arise(ModeEnact, Item{Content: result, Source: core.Enact})
 }
 
@@ -277,6 +314,10 @@ func (m *Machine) processEnact(item Item) {
 // --- Frame operations ---
 
 func (m *Machine) framePush(name string, elem FrameElement) {
+	if !validFrameTypes[name] {
+		core.Errorf("invalid frame type: %s", name)
+		return
+	}
 	m.Frames[name] = append(m.Frames[name], elem)
 }
 
@@ -347,23 +388,31 @@ func (m *Machine) frameText(name string) string {
 	return b.String()
 }
 
+// contextText concatenates all typed frames in order for use in prompts.
+func (m *Machine) contextText() string {
+	var b strings.Builder
+	index := 0
+	for _, name := range frameOrder {
+		for _, e := range m.Frames[name] {
+			fmt.Fprintf(&b, "%02x [%s] %s\n", index, name, e.Value)
+			index++
+		}
+	}
+	if index == 0 {
+		return "(empty context)"
+	}
+	return b.String()
+}
+
 // inferWithSystem calls the infer sibling with a system prompt and user message.
 func (m *Machine) inferWithSystem(systemPrompt, userMessage string) (string, error) {
 	if !m.useAPICalls(1) {
 		return "", fmt.Errorf("API budget exhausted")
 	}
 	bin := siblingPath("infer")
-	effectiveSystem := systemPrompt
-	if m.BaseFrame != "" {
-		if effectiveSystem != "" {
-			effectiveSystem = m.BaseFrame + "\n" + effectiveSystem
-		} else {
-			effectiveSystem = m.BaseFrame
-		}
-	}
 	var stdin string
-	if effectiveSystem != "" {
-		stdin = effectiveSystem + "\n\n" + userMessage
+	if systemPrompt != "" {
+		stdin = systemPrompt + "\n\n" + userMessage
 	} else {
 		stdin = "\n\n" + userMessage
 	}
@@ -374,13 +423,17 @@ func (m *Machine) inferWithSystem(systemPrompt, userMessage string) (string, err
 	stopProgress := core.StartProgress()
 	cmd := exec.CommandContext(ctx, bin, "-")
 	cmd.Stdin = strings.NewReader(stdin)
-	cmd.Env = append(os.Environ(), "ELMB_API_KEY="+m.APIKey)
+	cmd.Env = m.childEnv()
 	cmd.SysProcAttr = procGroupAttr()
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	stopProgress()
 	core.Newline()
+	if Trace.Enabled && stderr.Len() > 0 {
+		fmt.Fprint(os.Stderr, stderr.String())
+		core.TracePrint(stderr.String())
+	}
 	if err != nil {
 		errDetail := err.Error()
 		if stderr.Len() > 0 {
@@ -404,7 +457,7 @@ func (m *Machine) runCommandWithInput(command string, args []string, stdin strin
 
 	stopProgress := core.StartProgress()
 	cmd := exec.CommandContext(ctx, bin, args...)
-	cmd.Env = append(os.Environ(), "ELMB_API_KEY="+m.APIKey)
+	cmd.Env = m.childEnv()
 	cmd.SysProcAttr = procGroupAttr()
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
@@ -416,6 +469,10 @@ func (m *Machine) runCommandWithInput(command string, args []string, stdin strin
 	out, err := cmd.Output()
 	stopProgress()
 	core.Newline()
+	if Trace.Enabled && stderr.Len() > 0 {
+		fmt.Fprint(os.Stderr, stderr.String())
+		core.TracePrint(stderr.String())
+	}
 	if err != nil {
 		errDetail := err.Error()
 		if stderr.Len() > 0 {
@@ -432,15 +489,23 @@ func (m *Machine) runCommand(command string, args []string) (string, error) {
 	return m.runCommandWithInput(command, args, "")
 }
 
+func (m *Machine) childEnv() []string {
+	env := append(os.Environ(), "ELMB_API_KEY="+m.APIKey)
+	if Trace.Enabled {
+		env = append(env, "ELMB_VERBOSE=1")
+	}
+	return env
+}
+
 // --- Child spawning ---
 
 func (m *Machine) spawnCLIArgs(spec SpawnSpec) []string {
 	args := []string{"--plain", "--limit", modeNames[spec.Limit]}
+	if Trace.Enabled {
+		args = append(args, "--verbose")
+	}
 	if encoded := m.Config.EncodeValues(); encoded != "" {
 		args = append(args, "--value", encoded)
-	}
-	if spec.BaseFrame != "" {
-		args = append(args, "--frame", spec.BaseFrame)
 	}
 	args = append(args, spec.Command)
 	args = append(args, spec.Args...)
@@ -458,7 +523,7 @@ func (m *Machine) spawnSync(spec SpawnSpec) (string, error) {
 
 	stopProgress := core.StartProgress()
 	cmd := exec.CommandContext(ctx, bin, cliArgs...)
-	cmd.Env = append(os.Environ(), "ELMB_API_KEY="+m.APIKey)
+	cmd.Env = m.childEnv()
 	cmd.SysProcAttr = procGroupAttr()
 	if spec.Stdin != "" {
 		cmd.Stdin = strings.NewReader(spec.Stdin)
@@ -468,6 +533,10 @@ func (m *Machine) spawnSync(spec SpawnSpec) (string, error) {
 	out, err := cmd.Output()
 	stopProgress()
 	core.Newline()
+	if Trace.Enabled && stderr.Len() > 0 {
+		fmt.Fprint(os.Stderr, stderr.String())
+		core.TracePrint(stderr.String())
+	}
 	if err != nil {
 		errDetail := err.Error()
 		if stderr.Len() > 0 {
@@ -513,7 +582,7 @@ func (m *Machine) spawnAny(specs []SpawnSpec) (string, error) {
 			innerCtx, innerCancel := context.WithTimeout(ctx, time.Duration(m.TimeoutSeconds)*time.Second)
 			defer innerCancel()
 			cmd := exec.CommandContext(innerCtx, bin, cliArgs...)
-			cmd.Env = append(os.Environ(), "ELMB_API_KEY="+m.APIKey)
+			cmd.Env = m.childEnv()
 			cmd.SysProcAttr = procGroupAttr()
 			if s.Stdin != "" {
 				cmd.Stdin = strings.NewReader(s.Stdin)
@@ -521,6 +590,10 @@ func (m *Machine) spawnAny(specs []SpawnSpec) (string, error) {
 			var stderr bytes.Buffer
 			cmd.Stderr = &stderr
 			out, err := cmd.Output()
+			if Trace.Enabled && stderr.Len() > 0 {
+				fmt.Fprint(os.Stderr, stderr.String())
+				core.TracePrint(stderr.String())
+			}
 			if err != nil {
 				ch <- result{"", err}
 				return
@@ -583,7 +656,7 @@ func (m *Machine) spawnAsync(specs []SpawnSpec) *AsyncHandle {
 			innerCtx, innerCancel := context.WithTimeout(ctx, time.Duration(m.TimeoutSeconds)*time.Second)
 			defer innerCancel()
 			cmd := exec.CommandContext(innerCtx, bin, cliArgs...)
-			cmd.Env = append(os.Environ(), "ELMB_API_KEY="+m.APIKey)
+			cmd.Env = m.childEnv()
 			cmd.SysProcAttr = procGroupAttr()
 			if s.Stdin != "" {
 				cmd.Stdin = strings.NewReader(s.Stdin)
@@ -591,6 +664,10 @@ func (m *Machine) spawnAsync(specs []SpawnSpec) *AsyncHandle {
 			var stderr bytes.Buffer
 			cmd.Stderr = &stderr
 			out, err := cmd.Output()
+			if Trace.Enabled && stderr.Len() > 0 {
+				fmt.Fprint(os.Stderr, stderr.String())
+				core.TracePrint(stderr.String())
+			}
 			h.mu.Lock()
 			h.results[i] = AsyncResult{
 				Output: parseOutputBlock(string(out)),
@@ -644,11 +721,11 @@ func parseOutputBlock(raw string) string {
 	capturing := false
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
-		if trimmed == "[  output]" {
+		if strings.HasSuffix(trimmed, "[  output]") {
 			capturing = true
 			continue
 		}
-		if trimmed == "[exoutput]" {
+		if strings.HasSuffix(trimmed, "[exoutput]") {
 			break
 		}
 		if capturing {

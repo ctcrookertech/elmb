@@ -77,7 +77,7 @@ func (m *Machine) processLearn(item Item) {
 		return
 	}
 
-	frameCtx := m.frameText("")
+	frameCtx := m.contextText()
 
 	var extractSystemPrompt, extractUserPrompt string
 	var assessSystemPrompt, assessUserPrompt string
@@ -117,8 +117,8 @@ func (m *Machine) processLearn(item Item) {
 	}
 
 	specs := []SpawnSpec{
-		{Limit: ModeEnact, Command: "infer", Args: []string{"-"}, BaseFrame: m.BaseFrame, Stdin: extractSystemPrompt + "\n\n" + extractUserPrompt},
-		{Limit: ModeEnact, Command: "infer", Args: []string{"-"}, BaseFrame: m.BaseFrame, Stdin: assessSystemPrompt + "\n\n" + assessUserPrompt},
+		{Limit: ModeEnact, Command: "infer", Args: []string{"-"}, Stdin: extractSystemPrompt + "\n\n" + extractUserPrompt},
+		{Limit: ModeEnact, Command: "infer", Args: []string{"-"}, Stdin: assessSystemPrompt + "\n\n" + assessUserPrompt},
 	}
 
 	core.Line(core.Learn, "running extract and assess infer calls")
@@ -136,11 +136,11 @@ func (m *Machine) processLearn(item Item) {
 		switch d.Op {
 		case "+":
 			core.Line(core.Learn, "adding: "+d.Text)
-			m.framePush("", FrameElement{Value: d.Text, Level: LevelProc})
+			m.framePush(FrameProc, FrameElement{Value: d.Text, Level: LevelProc})
 			observations = append(observations, d.Text)
 		case "-":
 			core.Line(core.Learn, "removing: "+d.Text)
-			m.frameRemoveMatching("", d.Text)
+			m.frameRemoveMatching(FrameProc, d.Text)
 		}
 	}
 
@@ -163,8 +163,8 @@ func (m *Machine) processLearn(item Item) {
 		}
 	}
 
-	if len(m.Frames[""]) > compactThreshold {
-		m.compactFrame("")
+	if len(m.Frames[FrameProc]) > compactThreshold {
+		m.compactFrame(FrameProc)
 	}
 
 	summary := item.Content

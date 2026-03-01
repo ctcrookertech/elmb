@@ -19,6 +19,7 @@ const (
 	Frame    = "frame"
 	Arise    = "arise"
 	Relax    = "relax"
+	Satisfy  = "satisfy"
 )
 
 // Plain disables ANSI color codes in all tag output.
@@ -62,6 +63,7 @@ var tagColors = map[string]string{
 	Frame:    "\033[96m",
 	Arise:    "\033[93m",
 	Relax:    "\033[37m",
+	Satisfy:  "\033[92m",
 }
 
 func Tag(label string) string {

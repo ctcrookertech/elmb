@@ -50,7 +50,7 @@ func (m *Machine) processModel(item Item) {
 		return
 	}
 
-	frameCtx := m.frameText("")
+	frameCtx := m.contextText()
 
 	systemPrompt := "You are creating an actionable plan based on observations."
 
@@ -89,12 +89,12 @@ func (m *Machine) processModel(item Item) {
 			return
 		case "PLAN":
 			core.Line(core.Model, "plan: "+d.Text)
-			m.framePush("", FrameElement{Value: "plan: " + d.Text, Level: LevelTask})
+			m.framePush(FrameTask, FrameElement{Value: "plan: " + d.Text, Level: LevelTask})
 			planParts = append(planParts, "PLAN: "+d.Text)
 			hasPlan = true
 		case "STEP":
 			core.Line(core.Model, "step: "+d.Text)
-			m.framePush("", FrameElement{Value: "step: " + d.Text, Level: LevelStep})
+			m.framePush(FrameStep, FrameElement{Value: "step: " + d.Text, Level: LevelStep})
 			planParts = append(planParts, "STEP: "+d.Text)
 		case "REENACT":
 			core.Line(core.Model, "reenact: "+d.Text)

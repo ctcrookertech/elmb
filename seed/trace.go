@@ -46,10 +46,14 @@ func TraceState(m *Machine) {
 		fmt.Fprintf(os.Stderr, "%s%s stack[%s]: %d items\n", core.Prefix(), traceTag, modeNames[mode], len(m.Stacks[mode]))
 		traceFileWrite("%s%s stack[%s]: %d items\n", core.PlainPrefix(), traceTagPlain, modeNames[mode], len(m.Stacks[mode]))
 	}
-	fmt.Fprintf(os.Stderr, "%s%s frames: %d, budget: %d, errors: %d\n",
-		core.Prefix(), traceTag, len(m.Frames), m.APICallsRemaining, len(m.Errors))
-	traceFileWrite("%s%s frames: %d, budget: %d, errors: %d\n",
-		core.PlainPrefix(), traceTagPlain, len(m.Frames), m.APICallsRemaining, len(m.Errors))
+	total := 0
+	for _, name := range frameOrder {
+		total += len(m.Frames[name])
+	}
+	fmt.Fprintf(os.Stderr, "%s%s frames: %d items, budget: %d, errors: %d\n",
+		core.Prefix(), traceTag, total, m.APICallsRemaining, len(m.Errors))
+	traceFileWrite("%s%s frames: %d items, budget: %d, errors: %d\n",
+		core.PlainPrefix(), traceTagPlain, total, m.APICallsRemaining, len(m.Errors))
 }
 
 // TraceItem dumps item fields to stderr.
@@ -74,8 +78,8 @@ func TracePause() string {
 	if !Trace.Enabled || !Trace.Interactive {
 		return ""
 	}
-	fmt.Fprintf(os.Stderr, "%s%s press Enter to continue (or type a debug command): ", core.Prefix(), debugTag)
-	traceFileWrite("%s%s press Enter to continue (or type a debug command): ", core.PlainPrefix(), debugTagPlain)
+	fmt.Fprintf(os.Stderr, "%s%s > ", core.Prefix(), debugTag)
+	traceFileWrite("%s%s > ", core.PlainPrefix(), debugTagPlain)
 	scanner := bufio.NewScanner(os.Stdin)
 	if scanner.Scan() {
 		return strings.TrimSpace(scanner.Text())
@@ -83,43 +87,16 @@ func TracePause() string {
 	return ""
 }
 
-const debugSystemPrompt = `You are a debugger for the ELMB state machine. You have access to the current machine state as JSON.
-
-Available directives you can output (one per line):
-DUMP_STACKS — show all stack contents
-DUMP_FRAMES — show all frame names and sizes
-DUMP_FRAME: <name> — show contents of a specific frame (use empty string for default)
-SET_BUDGET: <n> — set API calls remaining to n
-CLEAR_STACK: <mode> — clear a mode's stack (enact/learn/model/build)
-PUSH_ITEM: <mode> <json> — push an item onto a mode's stack
-POP_ITEM: <mode> — pop the top item from a mode's stack
-SET_FRAME: <name> <json> — replace a frame's contents
-FRAME_PUSH: <name> <value> — push element onto a frame
-FRAME_POP: <name> — pop top element from a frame
-FRAME_REMOVE_RANGE: <name> <low> <high> — remove elements [low, high)
-FRAME_REPLACE_RANGE: <name> <low> <high> <target> — move range to target frame
-FRAME_CLONE: <src> <dst> — deep copy src frame to dst
-FRAME_SWAP: <a> <b> — swap two frames
-FRAME_CREATE: <name> <json> — create/replace a frame from JSON array
-OVERRIDE_RESPONSE: <text> — inject text as if it were an infer response
-SKIP — skip processing the current item
-CONTINUE — resume normal processing
-
-Respond with directives only. If the user asks a question, answer it briefly then output CONTINUE.`
-
-// DebugCommand processes an interactive debug input using infer.
-func (m *Machine) DebugCommand(input string) {
-	state := m.stateSnapshot()
-	prompt := "Current machine state:\n" + state + "\n\nUser command: " + input
-	result, err := m.inferWithSystem(debugSystemPrompt, prompt)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s%s infer error: %v\n", core.Prefix(), debugTag, err)
-		traceFileWrite("%s%s infer error: %v\n", core.PlainPrefix(), debugTagPlain, err)
-		return
+func debugPrint(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, core.Prefix()+format, args...)
+	plainArgs := make([]any, len(args))
+	copy(plainArgs, args)
+	for i, a := range plainArgs {
+		if s, ok := a.(string); ok && s == debugTag {
+			plainArgs[i] = debugTagPlain
+		}
 	}
-	fmt.Fprintf(os.Stderr, "%s%s response:\n%s\n", core.Prefix(), debugTag, result)
-	traceFileWrite("%s%s response:\n%s\n", core.PlainPrefix(), debugTagPlain, result)
-	m.applyDebugDirectives(result)
+	traceFileWrite(core.PlainPrefix()+format, plainArgs...)
 }
 
 type snapshotData struct {
@@ -146,192 +123,296 @@ func (m *Machine) stateSnapshot() string {
 	return string(b)
 }
 
-func debugPrint(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, core.Prefix()+format, args...)
-	plainArgs := make([]any, len(args))
-	copy(plainArgs, args)
-	for i, a := range plainArgs {
-		if s, ok := a.(string); ok && s == debugTag {
-			plainArgs[i] = debugTagPlain
+func debugHelp(filter string) {
+	help := `commands:
+  help [filter]                              show commands (optionally filtered)
+  state                                      full machine state as JSON
+  budget                                     show remaining API budget
+  budget <value>                             set API budget
+  stack list                                 show all stack contents
+  stack clear <mode>                         clear stack (enact/learn/model/build)
+  stack push <mode> <json>                   push item onto stack
+  stack pop <mode>                           pop top item from stack
+  frame list [type] [start] [end]            show frame elements (all types if no type)
+  frame push <type> <value>                  push element onto frame
+  frame pop <type>                           pop top element from frame
+  frame remove <type> <start> [end]          remove elements [start,end) from frame
+  frame replace <type> <start> [end] <target> move elements [start,end) to target frame
+  frame clone <source> <target>              clone frame
+  frame swap <first> <second>                swap two frames
+  frame create <type> <json>                 create/replace frame from JSON array
+  skip                                       skip current item
+  (Enter)                                    continue`
+	lower := strings.ToLower(filter)
+	for _, line := range strings.Split(help, "\n") {
+		if filter == "" || strings.Contains(strings.ToLower(line), lower) {
+			debugPrint("%s %s\n", debugTag, line)
 		}
 	}
-	traceFileWrite(core.PlainPrefix()+format, plainArgs...)
 }
 
-func (m *Machine) applyDebugDirectives(response string) {
-	for _, line := range strings.Split(response, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
+func (m *Machine) dumpAllFrames() {
+	index := 0
+	for _, name := range frameOrder {
+		for _, e := range m.Frames[name] {
+			debugPrint("  %02x [%s] %s\n", index, name, e.Value)
+			index++
 		}
-		switch {
-		case line == "DUMP_STACKS":
+	}
+	if index == 0 {
+		debugPrint("%s (empty)\n", debugTag)
+	}
+}
+
+func (m *Machine) dumpFrame(name string, args []string) {
+	frame := m.Frames[name]
+	if len(args) == 0 {
+		debugPrint("%s frame[%s] (%d elements):\n", debugTag, name, len(frame))
+		for i, e := range frame {
+			debugPrint("  %d: %s\n", i, e.Value)
+		}
+		return
+	}
+	start, err := strconv.Atoi(args[0])
+	if err != nil {
+		debugPrint("%s bad start: %s\n", debugTag, args[0])
+		return
+	}
+	end := len(frame)
+	if len(args) >= 2 {
+		end, err = strconv.Atoi(args[1])
+		if err != nil {
+			debugPrint("%s bad end: %s\n", debugTag, args[1])
+			return
+		}
+	}
+	if start < 0 || end > len(frame) || start >= end {
+		debugPrint("%s range [%d,%d) out of bounds (frame has %d elements)\n", debugTag, start, end, len(frame))
+		return
+	}
+	debugPrint("%s frame[%s] [%d,%d):\n", debugTag, name, start, end)
+	for i := start; i < end; i++ {
+		debugPrint("  %d: %s\n", i, frame[i].Value)
+	}
+}
+
+// DebugCommand processes a hard-coded debug command.
+func (m *Machine) DebugCommand(input string) {
+	parts := strings.Fields(input)
+	if len(parts) == 0 {
+		return
+	}
+	cmd := parts[0]
+	args := parts[1:]
+
+	switch cmd {
+	case "help":
+		filter := ""
+		if len(args) > 0 {
+			filter = args[0]
+		}
+		debugHelp(filter)
+
+	case "state":
+		debugPrint("%s\n%s\n", debugTag, m.stateSnapshot())
+
+	case "budget":
+		if len(args) == 0 {
+			m.mu.Lock()
+			remaining := m.APICallsRemaining
+			m.mu.Unlock()
+			debugPrint("%s budget: %d\n", debugTag, remaining)
+			return
+		}
+		value, err := strconv.Atoi(args[0])
+		if err != nil {
+			debugPrint("%s bad number: %s\n", debugTag, args[0])
+			return
+		}
+		m.mu.Lock()
+		m.APICallsRemaining = value
+		m.mu.Unlock()
+		debugPrint("%s budget set to %d\n", debugTag, value)
+
+	case "stack":
+		if len(args) == 0 {
+			debugPrint("%s stack requires: list, clear, push, or pop\n", debugTag)
+			return
+		}
+		switch args[0] {
+		case "list":
 			for mode := ModeEnact; mode < modeCount; mode++ {
 				debugPrint("%s stack[%s] (%d items):\n", debugTag, modeNames[mode], len(m.Stacks[mode]))
 				for i, item := range m.Stacks[mode] {
 					debugPrint("  %d: %s\n", i, strings.ReplaceAll(item.Content+item.Command, "\n", "\\n"))
 				}
 			}
-		case line == "DUMP_FRAMES":
-			for name, frame := range m.Frames {
-				display := name
-				if display == "" {
-					display = "(default)"
-				}
-				debugPrint("%s frame[%s]: %d elements\n", debugTag, display, len(frame))
+		case "clear":
+			if len(args) < 2 {
+				debugPrint("%s stack clear requires a mode (enact/learn/model/build)\n", debugTag)
+				return
 			}
-		case strings.HasPrefix(line, "DUMP_FRAME: "):
-			name := line[12:]
-			frame := m.Frames[name]
-			debugPrint("%s frame[%s] (%d elements):\n", debugTag, name, len(frame))
-			for i, e := range frame {
-				debugPrint("  %d: %s\n", i, e.Value)
-			}
-		case strings.HasPrefix(line, "SET_BUDGET: "):
-			var n int
-			if _, err := fmt.Sscanf(line[12:], "%d", &n); err != nil {
-				debugPrint("%s SET_BUDGET parse error: %v\n", debugTag, err)
-				continue
-			}
-			m.mu.Lock()
-			m.APICallsRemaining = n
-			m.mu.Unlock()
-			debugPrint("%s budget set to %d\n", debugTag, n)
-		case strings.HasPrefix(line, "CLEAR_STACK: "):
-			modeName := line[13:]
-			if mode, ok := modeByName(modeName); ok {
+			if mode, ok := modeByName(args[1]); ok {
 				m.Stacks[mode] = nil
-				debugPrint("%s cleared stack[%s]\n", debugTag, modeName)
+				debugPrint("%s cleared stack[%s]\n", debugTag, args[1])
+			} else {
+				debugPrint("%s unknown mode: %s\n", debugTag, args[1])
 			}
-		case strings.HasPrefix(line, "PUSH_ITEM: "):
-			rest := line[11:]
-			spaceIdx := strings.Index(rest, " ")
-			if spaceIdx < 0 {
-				continue
+		case "push":
+			if len(args) < 3 {
+				debugPrint("%s stack push requires <mode> <json>\n", debugTag)
+				return
 			}
-			modeName := rest[:spaceIdx]
-			itemJSON := rest[spaceIdx+1:]
+			mode, ok := modeByName(args[1])
+			if !ok {
+				debugPrint("%s unknown mode: %s\n", debugTag, args[1])
+				return
+			}
+			itemJSON := strings.Join(args[2:], " ")
 			var item Item
 			if json.Unmarshal([]byte(itemJSON), &item) != nil {
-				continue
+				debugPrint("%s bad item JSON\n", debugTag)
+				return
 			}
-			if mode, ok := modeByName(modeName); ok {
-				m.Stacks[mode] = append(m.Stacks[mode], item)
-				debugPrint("%s pushed item to stack[%s]\n", debugTag, modeName)
+			m.Stacks[mode] = append(m.Stacks[mode], item)
+			debugPrint("%s pushed item to stack[%s]\n", debugTag, args[1])
+		case "pop":
+			if len(args) < 2 {
+				debugPrint("%s stack pop requires a mode (enact/learn/model/build)\n", debugTag)
+				return
 			}
-		case strings.HasPrefix(line, "POP_ITEM: "):
-			modeName := line[10:]
-			if mode, ok := modeByName(modeName); ok && len(m.Stacks[mode]) > 0 {
+			if mode, ok := modeByName(args[1]); ok && len(m.Stacks[mode]) > 0 {
 				m.Stacks[mode] = m.Stacks[mode][:len(m.Stacks[mode])-1]
-				debugPrint("%s popped item from stack[%s]\n", debugTag, modeName)
+				debugPrint("%s popped item from stack[%s]\n", debugTag, args[1])
+			} else {
+				debugPrint("%s stack empty or unknown mode: %s\n", debugTag, args[1])
 			}
-		case strings.HasPrefix(line, "SET_FRAME: "):
-			rest := line[11:]
-			spaceIdx := strings.Index(rest, " ")
-			if spaceIdx < 0 {
-				continue
-			}
-			name := rest[:spaceIdx]
-			frameJSON := rest[spaceIdx+1:]
-			var elems []FrameElement
-			if json.Unmarshal([]byte(frameJSON), &elems) != nil {
-				continue
-			}
-			m.Frames[name] = elems
-			debugPrint("%s set frame[%s] to %d elements\n", debugTag, name, len(elems))
+		default:
+			debugPrint("%s unknown stack command: %s\n", debugTag, args[0])
+		}
 
-		// --- Frame operations ---
-
-		case strings.HasPrefix(line, "FRAME_PUSH: "):
-			rest := line[12:]
-			spaceIdx := strings.Index(rest, " ")
-			if spaceIdx < 0 {
-				continue
+	case "frame":
+		if len(args) == 0 {
+			debugPrint("%s frame requires: list, push, pop, remove, replace, clone, swap, or create\n", debugTag)
+			return
+		}
+		switch args[0] {
+		case "list":
+			if len(args) == 1 {
+				m.dumpAllFrames()
+			} else {
+				m.dumpFrame(args[1], args[2:])
 			}
-			name := rest[:spaceIdx]
-			value := rest[spaceIdx+1:]
+		case "push":
+			if len(args) < 3 {
+				debugPrint("%s frame push requires <name> <value>\n", debugTag)
+				return
+			}
+			name := args[1]
+			value := strings.Join(args[2:], " ")
 			m.framePush(name, FrameElement{Value: value, Level: LevelProc})
 			debugPrint("%s pushed to frame[%s]\n", debugTag, name)
-		case strings.HasPrefix(line, "FRAME_POP: "):
-			name := line[11:]
-			elem := m.framePop(name)
-			debugPrint("%s popped from frame[%s]: %s\n", debugTag, name, elem.Value)
-		case strings.HasPrefix(line, "FRAME_REMOVE_RANGE: "):
-			rest := line[20:]
-			parts := strings.Fields(rest)
-			if len(parts) != 3 {
-				continue
+		case "pop":
+			if len(args) < 2 {
+				debugPrint("%s frame pop requires a frame name\n", debugTag)
+				return
 			}
-			name := parts[0]
-			low, err1 := strconv.Atoi(parts[1])
-			high, err2 := strconv.Atoi(parts[2])
-			if err1 != nil || err2 != nil {
-				continue
+			name := args[1]
+			element := m.framePop(name)
+			debugPrint("%s popped from frame[%s]: %s\n", debugTag, name, element.Value)
+		case "remove":
+			if len(args) < 3 {
+				debugPrint("%s frame remove requires <name> <start> [end]\n", debugTag)
+				return
 			}
-			f := m.Frames[name]
-			if low < 0 || high > len(f) || low >= high {
-				debugPrint("%s FRAME_REMOVE_RANGE: out of bounds\n", debugTag)
-				continue
+			name := args[1]
+			start, err := strconv.Atoi(args[2])
+			if err != nil {
+				debugPrint("%s bad start: %s\n", debugTag, args[2])
+				return
 			}
-			m.frameRemoveRange(name, low, high)
-			debugPrint("%s removed range [%d,%d) from frame[%s]\n", debugTag, low, high, name)
-		case strings.HasPrefix(line, "FRAME_REPLACE_RANGE: "):
-			rest := line[21:]
-			parts := strings.Fields(rest)
-			if len(parts) != 4 {
-				continue
+			frame := m.Frames[name]
+			end := len(frame)
+			if len(args) >= 4 {
+				end, err = strconv.Atoi(args[3])
+				if err != nil {
+					debugPrint("%s bad end: %s\n", debugTag, args[3])
+					return
+				}
 			}
-			name := parts[0]
-			low, err1 := strconv.Atoi(parts[1])
-			high, err2 := strconv.Atoi(parts[2])
-			target := parts[3]
-			if err1 != nil || err2 != nil {
-				continue
+			if start < 0 || end > len(frame) || start >= end {
+				debugPrint("%s range [%d,%d) out of bounds (frame has %d elements)\n", debugTag, start, end, len(frame))
+				return
 			}
-			f := m.Frames[name]
-			if low < 0 || high > len(f) || low >= high {
-				debugPrint("%s FRAME_REPLACE_RANGE: out of bounds\n", debugTag)
-				continue
+			m.frameRemoveRange(name, start, end)
+			debugPrint("%s removed [%d,%d) from frame[%s]\n", debugTag, start, end, name)
+		case "replace":
+			if len(args) < 4 {
+				debugPrint("%s frame replace requires <name> <start> <target> or <name> <start> <end> <target>\n", debugTag)
+				return
 			}
-			m.frameReplaceRange(name, low, high, target)
-			debugPrint("%s replaced range [%d,%d) from frame[%s] into frame[%s]\n", debugTag, low, high, name, target)
-		case strings.HasPrefix(line, "FRAME_CLONE: "):
-			rest := line[13:]
-			parts := strings.Fields(rest)
-			if len(parts) != 2 {
-				continue
+			name := args[1]
+			start, err := strconv.Atoi(args[2])
+			if err != nil {
+				debugPrint("%s bad start: %s\n", debugTag, args[2])
+				return
 			}
-			m.frameClone(parts[0], parts[1])
-			debugPrint("%s cloned frame[%s] to frame[%s]\n", debugTag, parts[0], parts[1])
-		case strings.HasPrefix(line, "FRAME_SWAP: "):
-			rest := line[12:]
-			parts := strings.Fields(rest)
-			if len(parts) != 2 {
-				continue
+			frame := m.Frames[name]
+			var end int
+			var target string
+			if len(args) >= 5 {
+				end, err = strconv.Atoi(args[3])
+				if err != nil {
+					debugPrint("%s bad end: %s\n", debugTag, args[3])
+					return
+				}
+				target = args[4]
+			} else {
+				end = len(frame)
+				target = args[3]
 			}
-			m.frameSwap(parts[0], parts[1])
-			debugPrint("%s swapped frame[%s] and frame[%s]\n", debugTag, parts[0], parts[1])
-		case strings.HasPrefix(line, "FRAME_CREATE: "):
-			rest := line[14:]
-			spaceIdx := strings.Index(rest, " ")
-			if spaceIdx < 0 {
-				continue
+			if start < 0 || end > len(frame) || start >= end {
+				debugPrint("%s range [%d,%d) out of bounds (frame has %d elements)\n", debugTag, start, end, len(frame))
+				return
 			}
-			name := rest[:spaceIdx]
-			frameJSON := rest[spaceIdx+1:]
-			var elems []FrameElement
-			if json.Unmarshal([]byte(frameJSON), &elems) != nil {
-				continue
+			m.frameReplaceRange(name, start, end, target)
+			debugPrint("%s moved [%d,%d) from frame[%s] to frame[%s]\n", debugTag, start, end, name, target)
+		case "clone":
+			if len(args) < 3 {
+				debugPrint("%s frame clone requires <source> <target>\n", debugTag)
+				return
 			}
-			m.frameCreate(name, elems)
-			debugPrint("%s created frame[%s] with %d elements\n", debugTag, name, len(elems))
-
-		case strings.HasPrefix(line, "OVERRIDE_RESPONSE: "):
-			debugPrint("%s override response noted (not applied in this context)\n", debugTag)
-		case line == "SKIP":
-			debugPrint("%s skip directive noted\n", debugTag)
-		case line == "CONTINUE":
-			// resume normal processing
+			m.frameClone(args[1], args[2])
+			debugPrint("%s cloned frame[%s] to frame[%s]\n", debugTag, args[1], args[2])
+		case "swap":
+			if len(args) < 3 {
+				debugPrint("%s frame swap requires <first> <second>\n", debugTag)
+				return
+			}
+			m.frameSwap(args[1], args[2])
+			debugPrint("%s swapped frame[%s] and frame[%s]\n", debugTag, args[1], args[2])
+		case "create":
+			if len(args) < 3 {
+				debugPrint("%s frame create requires <name> <json>\n", debugTag)
+				return
+			}
+			name := args[1]
+			frameJSON := strings.Join(args[2:], " ")
+			var elements []FrameElement
+			if json.Unmarshal([]byte(frameJSON), &elements) != nil {
+				debugPrint("%s bad frame JSON\n", debugTag)
+				return
+			}
+			m.frameCreate(name, elements)
+			debugPrint("%s created frame[%s] with %d elements\n", debugTag, name, len(elements))
+		default:
+			debugPrint("%s unknown frame command: %s\n", debugTag, args[0])
 		}
+
+	case "skip":
+		debugPrint("%s skipping current item\n", debugTag)
+
+	default:
+		debugPrint("%s unknown command: %s (type 'help' for commands)\n", debugTag, cmd)
 	}
 }
