@@ -3,43 +3,76 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ctcrookertech/elmb/core"
 )
 
 func main() {
-	if len(os.Args) < 3 {
-		core.Errorf("usage: infer <key> <text...>")
+	key := os.Getenv("ELMB_API_KEY")
+	if key == "" {
+		core.Errorf("ELMB_API_KEY not set")
 		os.Exit(1)
 	}
 
-	key := os.Args[1]
-	textArgs := os.Args[2:]
-	var input string
-	if len(textArgs) == 1 && textArgs[0] == "-" {
+	args := os.Args[1:]
+	if len(args) < 1 {
+		core.Errorf("usage: infer <text...> or infer -")
+		os.Exit(1)
+	}
+
+	var systemPrompt string
+	var userMessage string
+
+	if len(args) == 1 && args[0] == "-" {
 		raw, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			core.Errorf("reading stdin: %v", err)
 			os.Exit(1)
 		}
-		input = string(raw)
+		input := string(raw)
+		// Protocol: first line = system prompt, blank line separator, rest = user message
+		if idx := strings.Index(input, "\n\n"); idx >= 0 {
+			systemPrompt = input[:idx]
+			userMessage = input[idx+2:]
+		} else {
+			userMessage = input
+		}
 	} else {
-		input = strings.Join(textArgs, " ")
+		userMessage = strings.Join(args, " ")
 	}
 
-	body, _ := json.Marshal(map[string]any{
+	timeoutSec := 120
+	if raw := os.Getenv("ELMB_TIMEOUT"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			timeoutSec = n
+		}
+	}
+
+	messages := []map[string]string{{"role": "user", "content": userMessage}}
+	reqBody := map[string]any{
 		"model":      "claude-sonnet-4-6",
 		"max_tokens": 4096,
 		"stream":     true,
-		"messages":   []map[string]string{{"role": "user", "content": input}},
-	})
+		"messages":   messages,
+	}
+	if systemPrompt != "" {
+		reqBody["system"] = systemPrompt
+	}
 
-	req, _ := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
+	body, _ := json.Marshal(reqBody) // infallible: static types
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec)*time.Second)
+	defer cancel()
+
+	req, _ := http.NewRequestWithContext(ctx, "POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(body)) // infallible: constant URL
 	req.Header.Set("x-api-key", key)
 	req.Header.Set("anthropic-version", "2023-06-01")
 	req.Header.Set("content-type", "application/json")
@@ -58,7 +91,8 @@ func main() {
 	if resp.StatusCode != 200 {
 		stopProgress()
 		core.Newline()
-		core.Errorf("HTTP %d", resp.StatusCode)
+		respBody, _ := io.ReadAll(resp.Body) // best-effort: error context
+		core.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
 		os.Exit(1)
 	}
 
@@ -80,7 +114,7 @@ func main() {
 			} `json:"delta"`
 		}
 		if json.Unmarshal([]byte(data), &event) != nil {
-			continue
+			continue // best-effort: skip malformed SSE events
 		}
 		if event.Type != "content_block_delta" {
 			continue
@@ -91,12 +125,18 @@ func main() {
 			core.BlockStart()
 			first = false
 		}
-		core.Print(event.Delta.Text)
+		text := event.Delta.Text
+		text = strings.ReplaceAll(text, "[  output]", "[ _output]")
+		text = strings.ReplaceAll(text, "[exoutput]", "[e_output]")
+		core.Print(text)
 	}
 
 	if first {
 		stopProgress()
+		core.Newline()
 	}
 
-	core.BlockEnd()
+	if !first {
+		core.BlockEnd()
+	}
 }
