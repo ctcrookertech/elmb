@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/ctcrookertech/elmb/core"
 )
@@ -46,6 +50,15 @@ func parseLimit(s string) Mode {
 	return ModeBuild
 }
 
+func modeByName(name string) (Mode, bool) {
+	for m := ModeEnact; m < modeCount; m++ {
+		if modeNames[m] == name {
+			return m, true
+		}
+	}
+	return 0, false
+}
+
 // FrameLevel indicates the granularity of a frame element.
 type FrameLevel int
 
@@ -58,17 +71,18 @@ const (
 
 // FrameElement is a typed element in a frame.
 type FrameElement struct {
-	Value string
-	Level FrameLevel
+	Value string     `json:"value"`
+	Level FrameLevel `json:"level"`
 }
 
 // Item is a work unit on a mode stack.
 type Item struct {
-	Content string
-	Source  string
-	Command string
-	Args    []string
-	Depth   int
+	Content    string   `json:"content,omitempty"`
+	Source     string   `json:"source,omitempty"`
+	Command    string   `json:"command,omitempty"`
+	Args       []string `json:"args,omitempty"`
+	Depth      int      `json:"depth,omitempty"`
+	RelaxCount int      `json:"relax_count,omitempty"`
 }
 
 // SpawnSpec describes a child elmb instance to spawn.
@@ -80,20 +94,56 @@ type SpawnSpec struct {
 	Stdin     string
 }
 
+const (
+	DefaultAPIBudget = 50
+	DefaultTimeout   = 120
+	MaxRelaxCount    = 5
+)
+
 // Machine holds the full ELMB state.
 type Machine struct {
-	Stacks [modeCount][]Item
-	Frames map[string][]FrameElement
-	Limit  Mode
-	APIKey string
+	Stacks            [modeCount][]Item
+	Frames            map[string][]FrameElement
+	Limit             Mode
+	APIKey            string
+	Config            *Config
+	BaseFrame         string
+	APICallsRemaining int
+	TimeoutSeconds    int
+	Errors            []string
+	mu                sync.Mutex
 }
 
 // NewMachine creates a machine with the seed action on the enact stack.
-func NewMachine(limit Mode, apiKey string, command string, args []string) *Machine {
+func NewMachine(limit Mode, config *Config, command string, args []string, baseFrame string) *Machine {
+	apiKey := config.ResolveAPIKey()
+
+	budget := DefaultAPIBudget
+	if raw := config.Resolve("ELMB_API_BUDGET"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			budget = n
+		}
+	}
+
+	timeout := DefaultTimeout
+	if raw := config.Resolve("ELMB_TIMEOUT"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			timeout = n
+		}
+	}
+
+	if baseFrame == "" {
+		baseFrame = "OS: " + runtime.GOOS + "/" + runtime.GOARCH
+	}
+
 	m := &Machine{
-		Frames: map[string][]FrameElement{},
-		Limit:  limit,
-		APIKey: apiKey,
+		Frames:            map[string][]FrameElement{},
+		Limit:             limit,
+		APIKey:            apiKey,
+		Config:            config,
+		BaseFrame:         baseFrame,
+		APICallsRemaining: budget,
+		TimeoutSeconds:    timeout,
 	}
 	seed := Item{Command: command, Args: args, Source: "seed"}
 	m.Stacks[ModeEnact] = append(m.Stacks[ModeEnact], seed)
@@ -101,9 +151,18 @@ func NewMachine(limit Mode, apiKey string, command string, args []string) *Machi
 	return m
 }
 
-// Run executes the processing loop until all stacks are empty.
-func (m *Machine) Run() {
+// Run executes the processing loop until all stacks are empty or budget is exhausted.
+func (m *Machine) Run() error {
 	for {
+		m.mu.Lock()
+		budgetLeft := m.APICallsRemaining
+		m.mu.Unlock()
+		if budgetLeft <= 0 {
+			core.Line(core.Error, "API budget exhausted")
+			m.Errors = append(m.Errors, "API budget exhausted")
+			break
+		}
+
 		found := false
 		for mode := ModeEnact; mode < modeCount; mode++ {
 			if len(m.Stacks[mode]) == 0 {
@@ -127,14 +186,34 @@ func (m *Machine) Run() {
 		core.Print("\n")
 	}
 	core.BlockEnd()
+
+	if len(m.Errors) > 0 {
+		return fmt.Errorf("%d errors: %s", len(m.Errors), strings.Join(m.Errors, "; "))
+	}
+	return nil
 }
 
 // drain processes all items on a mode's stack before returning.
 func (m *Machine) drain(mode Mode) {
 	for len(m.Stacks[mode]) > 0 {
+		m.mu.Lock()
+		budgetLeft := m.APICallsRemaining
+		m.mu.Unlock()
+		if budgetLeft <= 0 {
+			return
+		}
+
 		item := m.Stacks[mode][len(m.Stacks[mode])-1]
 		m.Stacks[mode] = m.Stacks[mode][:len(m.Stacks[mode])-1]
 		core.Line(modeTag[mode], "processing: "+strings.ReplaceAll(item.Content+item.Command, "\n", " "))
+
+		TraceItem(modeNames[mode], item)
+		TraceState(m)
+
+		if input := TracePause(); input != "" {
+			m.DebugCommand(input)
+		}
+
 		switch mode {
 		case ModeEnact:
 			m.processEnact(item)
@@ -160,10 +239,16 @@ func (m *Machine) arise(from Mode, item Item) {
 	m.Stacks[upper] = append(m.Stacks[upper], item)
 }
 
-// relax moves an item down to the next lower mode.
+// relax moves an item down to the next lower mode. Caps at MaxRelaxCount.
 func (m *Machine) relax(from Mode, item Item) {
 	if from <= ModeEnact {
 		core.Errorf("cannot relax below enact")
+		return
+	}
+	item.RelaxCount++
+	if item.RelaxCount >= MaxRelaxCount {
+		core.Line(core.Frame, "relax count exceeded, forcing to frame: "+strings.ReplaceAll(item.Content, "\n", " "))
+		m.framePush("", FrameElement{Value: item.Content, Level: LevelProc})
 		return
 	}
 	lower := from - 1
@@ -176,7 +261,10 @@ func (m *Machine) processEnact(item Item) {
 	core.Line(core.Enact, "running: "+item.Command)
 	result, err := m.runCommand(item.Command, item.Args)
 	if err != nil {
+		errMsg := "Command failed: " + item.Command + " " + strings.Join(item.Args, " ") + "\nError: " + err.Error()
 		core.Errorf("enact failed: %v", err)
+		m.Errors = append(m.Errors, "enact: "+err.Error())
+		m.arise(ModeEnact, Item{Content: errMsg, Source: core.Enact + ":error"})
 		return
 	}
 	core.Line(core.Frame, "add: "+strings.ReplaceAll(result, "\n", " "))
@@ -228,6 +316,20 @@ func (m *Machine) frameCreate(name string, elems []FrameElement) {
 	m.Frames[name] = elems
 }
 
+// --- Budget ---
+
+// useAPICalls decrements the budget by n. Returns false if insufficient budget.
+func (m *Machine) useAPICalls(n int) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.APICallsRemaining < n {
+		return false
+	}
+	m.APICallsRemaining -= n
+	TraceLine("budget", "used "+strconv.Itoa(n)+", remaining: "+strconv.Itoa(m.APICallsRemaining))
+	return true
+}
+
 // --- Infer helpers ---
 
 func (m *Machine) frameText(name string) string {
@@ -245,55 +347,133 @@ func (m *Machine) frameText(name string) string {
 	return b.String()
 }
 
-func (m *Machine) runCommandWithInput(command string, args []string, stdin string) (string, error) {
-	bin := siblingPath(command)
-	stopProgress := core.StartProgress()
-	cmd := exec.Command(bin, args...)
-	if stdin != "" {
-		cmd.Stdin = strings.NewReader(stdin)
+// inferWithSystem calls the infer sibling with a system prompt and user message.
+func (m *Machine) inferWithSystem(systemPrompt, userMessage string) (string, error) {
+	if !m.useAPICalls(1) {
+		return "", fmt.Errorf("API budget exhausted")
 	}
+	bin := siblingPath("infer")
+	effectiveSystem := systemPrompt
+	if m.BaseFrame != "" {
+		if effectiveSystem != "" {
+			effectiveSystem = m.BaseFrame + "\n" + effectiveSystem
+		} else {
+			effectiveSystem = m.BaseFrame
+		}
+	}
+	var stdin string
+	if effectiveSystem != "" {
+		stdin = effectiveSystem + "\n\n" + userMessage
+	} else {
+		stdin = "\n\n" + userMessage
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(m.TimeoutSeconds)*time.Second)
+	defer cancel()
+
+	stopProgress := core.StartProgress()
+	cmd := exec.CommandContext(ctx, bin, "-")
+	cmd.Stdin = strings.NewReader(stdin)
+	cmd.Env = append(os.Environ(), "ELMB_API_KEY="+m.APIKey)
+	cmd.SysProcAttr = procGroupAttr()
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	stopProgress()
 	core.Newline()
 	if err != nil {
-		return "", err
+		errDetail := err.Error()
+		if stderr.Len() > 0 {
+			errDetail += ": " + stderr.String()
+		}
+		TraceLine("infer", "failed: "+errDetail)
+		return "", fmt.Errorf("infer: %s", errDetail)
 	}
 	return parseOutputBlock(string(out)), nil
 }
 
+// inferDirect calls infer with no system prompt.
 func (m *Machine) inferDirect(prompt string) (string, error) {
-	return m.runCommandWithInput("infer", []string{m.APIKey, "-"}, prompt)
+	return m.inferWithSystem("", prompt)
+}
+
+func (m *Machine) runCommandWithInput(command string, args []string, stdin string) (string, error) {
+	bin := siblingPath(command)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(m.TimeoutSeconds)*time.Second)
+	defer cancel()
+
+	stopProgress := core.StartProgress()
+	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd.Env = append(os.Environ(), "ELMB_API_KEY="+m.APIKey)
+	cmd.SysProcAttr = procGroupAttr()
+	if stdin != "" {
+		cmd.Stdin = strings.NewReader(stdin)
+	} else {
+		cmd.Stdin = os.Stdin
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	stopProgress()
+	core.Newline()
+	if err != nil {
+		errDetail := err.Error()
+		if stderr.Len() > 0 {
+			errDetail += ": " + stderr.String()
+		}
+		return "", fmt.Errorf("%s: %s", command, errDetail)
+	}
+	return parseOutputBlock(string(out)), nil
 }
 
 // --- Subprocess execution ---
 
 func (m *Machine) runCommand(command string, args []string) (string, error) {
-	bin := siblingPath(command)
-	stopProgress := core.StartProgress()
-	out, err := exec.Command(bin, args...).Output()
-	stopProgress()
-	core.Newline()
-	if err != nil {
-		return "", err
-	}
-	return parseOutputBlock(string(out)), nil
+	return m.runCommandWithInput(command, args, "")
 }
 
 // --- Child spawning ---
 
+func (m *Machine) spawnCLIArgs(spec SpawnSpec) []string {
+	args := []string{"--plain", "--limit", modeNames[spec.Limit]}
+	if encoded := m.Config.EncodeValues(); encoded != "" {
+		args = append(args, "--value", encoded)
+	}
+	if spec.BaseFrame != "" {
+		args = append(args, "--frame", spec.BaseFrame)
+	}
+	args = append(args, spec.Command)
+	args = append(args, spec.Args...)
+	return args
+}
+
 func (m *Machine) spawnSync(spec SpawnSpec) (string, error) {
+	if !m.useAPICalls(1) {
+		return "", fmt.Errorf("API budget exhausted")
+	}
 	bin := siblingPath("elmb")
-	cliArgs := append([]string{"--plain", "--limit", modeNames[spec.Limit], spec.Command}, spec.Args...)
+	cliArgs := m.spawnCLIArgs(spec)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(m.TimeoutSeconds)*time.Second)
+	defer cancel()
+
 	stopProgress := core.StartProgress()
-	cmd := exec.Command(bin, cliArgs...)
+	cmd := exec.CommandContext(ctx, bin, cliArgs...)
+	cmd.Env = append(os.Environ(), "ELMB_API_KEY="+m.APIKey)
+	cmd.SysProcAttr = procGroupAttr()
 	if spec.Stdin != "" {
 		cmd.Stdin = strings.NewReader(spec.Stdin)
 	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	stopProgress()
 	core.Newline()
 	if err != nil {
-		return "", err
+		errDetail := err.Error()
+		if stderr.Len() > 0 {
+			errDetail += ": " + stderr.String()
+		}
+		return "", fmt.Errorf("spawn: %s", errDetail)
 	}
 	return parseOutputBlock(string(out)), nil
 }
@@ -329,11 +509,17 @@ func (m *Machine) spawnAny(specs []SpawnSpec) (string, error) {
 	for _, spec := range specs {
 		go func(s SpawnSpec) {
 			bin := siblingPath("elmb")
-			cliArgs := append([]string{"--plain", "--limit", modeNames[s.Limit], s.Command}, s.Args...)
-			cmd := exec.CommandContext(ctx, bin, cliArgs...)
+			cliArgs := m.spawnCLIArgs(s)
+			innerCtx, innerCancel := context.WithTimeout(ctx, time.Duration(m.TimeoutSeconds)*time.Second)
+			defer innerCancel()
+			cmd := exec.CommandContext(innerCtx, bin, cliArgs...)
+			cmd.Env = append(os.Environ(), "ELMB_API_KEY="+m.APIKey)
+			cmd.SysProcAttr = procGroupAttr()
 			if s.Stdin != "" {
 				cmd.Stdin = strings.NewReader(s.Stdin)
 			}
+			var stderr bytes.Buffer
+			cmd.Stderr = &stderr
 			out, err := cmd.Output()
 			if err != nil {
 				ch <- result{"", err}
@@ -393,11 +579,17 @@ func (m *Machine) spawnAsync(specs []SpawnSpec) *AsyncHandle {
 		go func(i int, s SpawnSpec) {
 			defer wg.Done()
 			bin := siblingPath("elmb")
-			cliArgs := append([]string{"--plain", "--limit", modeNames[s.Limit], s.Command}, s.Args...)
-			cmd := exec.CommandContext(ctx, bin, cliArgs...)
+			cliArgs := m.spawnCLIArgs(s)
+			innerCtx, innerCancel := context.WithTimeout(ctx, time.Duration(m.TimeoutSeconds)*time.Second)
+			defer innerCancel()
+			cmd := exec.CommandContext(innerCtx, bin, cliArgs...)
+			cmd.Env = append(os.Environ(), "ELMB_API_KEY="+m.APIKey)
+			cmd.SysProcAttr = procGroupAttr()
 			if s.Stdin != "" {
 				cmd.Stdin = strings.NewReader(s.Stdin)
 			}
+			var stderr bytes.Buffer
+			cmd.Stderr = &stderr
 			out, err := cmd.Output()
 			h.mu.Lock()
 			h.results[i] = AsyncResult{
@@ -417,7 +609,13 @@ func (m *Machine) spawnAsync(specs []SpawnSpec) *AsyncHandle {
 
 // --- Helpers ---
 
+var allowedSiblings = map[string]bool{"infer": true, "elmb": true}
+
 func siblingPath(name string) string {
+	if strings.ContainsAny(name, "/\\") || !allowedSiblings[name] {
+		core.Errorf("rejected sibling path: %s", name)
+		os.Exit(1)
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		core.Errorf("cannot locate self: %v", err)
@@ -459,4 +657,3 @@ func parseOutputBlock(raw string) string {
 	}
 	return strings.Join(content, "\n")
 }
-
