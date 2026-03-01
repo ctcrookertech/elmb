@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -22,9 +23,28 @@ func main() {
 		os.Exit(1)
 	}
 
+	verbose := os.Getenv("ELMB_VERBOSE") != ""
+
+	modelAliases := map[string]string{
+		"sonnet": "claude-sonnet-4-6",
+		"haiku":  "claude-haiku-4-5",
+		"opus":   "claude-opus-4-6",
+	}
+	modelID := "claude-sonnet-4-6"
+
 	args := os.Args[1:]
+	for len(args) >= 2 && args[0] == "--model" {
+		alias := args[1]
+		if full, ok := modelAliases[alias]; ok {
+			modelID = full
+		} else {
+			modelID = alias
+		}
+		args = args[2:]
+	}
+
 	if len(args) < 1 {
-		core.Errorf("usage: infer <text...> or infer -")
+		core.Errorf("usage: infer [--model <alias|id>] <text...> or infer -")
 		os.Exit(1)
 	}
 
@@ -49,6 +69,14 @@ func main() {
 		userMessage = strings.Join(args, " ")
 	}
 
+	if verbose {
+		fmt.Fprintf(os.Stderr, "%s\033[90m[   trace]\033[0m infer: model=%s\n", core.Prefix(), modelID)
+		if systemPrompt != "" {
+			fmt.Fprintf(os.Stderr, "%s\033[90m[   trace]\033[0m infer: system=%s\n", core.Prefix(), systemPrompt)
+		}
+		fmt.Fprintf(os.Stderr, "%s\033[90m[   trace]\033[0m infer: prompt=%s\n", core.Prefix(), userMessage)
+	}
+
 	timeoutSec := 120
 	if raw := os.Getenv("ELMB_TIMEOUT"); raw != "" {
 		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
@@ -58,7 +86,7 @@ func main() {
 
 	messages := []map[string]string{{"role": "user", "content": userMessage}}
 	reqBody := map[string]any{
-		"model":      "claude-sonnet-4-6",
+		"model":      modelID,
 		"max_tokens": 4096,
 		"stream":     true,
 		"messages":   messages,

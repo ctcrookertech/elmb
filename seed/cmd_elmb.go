@@ -49,6 +49,9 @@ func main() {
 			}
 			traceFilePath = args[1]
 			args = args[2:]
+		case "--verbose":
+			Trace.Enabled = true
+			args = args[1:]
 		case "--debug":
 			debug = true
 			args = args[1:]
@@ -58,8 +61,12 @@ func main() {
 	}
 
 	if len(args) < 1 {
-		core.Errorf("usage: elmb [--plain] [--limit enact|learn|model|build] [--value overrides] [--frame text] [--trace file] [--debug] <command> [args...]")
+		core.Errorf("usage: elmb [--plain] [--verbose] [--limit enact|learn|model|build] [--value overrides] [--frame text] [--trace file] [--debug] <command> [args...]")
 		os.Exit(1)
+	}
+
+	if os.Getenv("ELMB_VERBOSE") != "" {
+		Trace.Enabled = true
 	}
 
 	if traceFilePath != "" {
